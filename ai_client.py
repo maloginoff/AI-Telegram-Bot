@@ -42,6 +42,55 @@ class ServerError(Exception):
     pass
 
 
+def _is_rate_limit_error(error_obj: dict | str) -> bool:
+    """Проверяет является ли ошибка rate limit / quota exceeded."""
+    if isinstance(error_obj, dict):
+        text = json.dumps(error_obj).lower()
+    else:
+        text = str(error_obj).lower()
+
+    rate_phrases = [
+        "rate_limit_exceeded",
+        "rate limit",
+        "quota exceeded",
+        "resource_exhausted",
+        "resource has been exhausted",
+        "too many requests",
+        "limit reached",
+        "insufficient_quota",
+        "exceeded your current quota",
+        "requests per minute",
+        "tokens per minute",
+    ]
+    return any(phrase in text for phrase in rate_phrases)
+
+
+def _is_auth_error(error_obj: dict | str) -> bool:
+    """Проверяет является ли ошибка авторизационной."""
+    if isinstance(error_obj, dict):
+        text = json.dumps(error_obj).lower()
+    else:
+        text = str(error_obj).lower()
+
+    auth_phrases = [
+        "invalid api key",
+        "invalid_api_key",
+        "api key not valid",
+        "api_key_invalid",
+        "permission denied",
+        "authentication failed",
+    ]
+    return any(phrase in text for phrase in auth_phrases)
+
+
+def _classify_error(error_obj: dict | str) -> None:
+    """Бросает нужное исключение если ошибка распознана."""
+    if _is_rate_limit_error(error_obj):
+        raise KeyExhaustedException()
+    if _is_auth_error(error_obj):
+        raise KeyAuthError()
+
+
 class AiClient:
     def __init__(self, config: Config, key_manager: ApiKeyManager) -> None:
         self._config = config
@@ -116,22 +165,6 @@ class AiClient:
         recovery = await self._key_manager.get_recovery_time(provider)
         raise AllKeysExhaustedError(recovery)
 
-    def _check_error_in_body(self, text: str) -> None:
-        """Проверяет тело ответа на ошибки, которые приходят со статусом 200."""
-        lower = text.lower()
-        rate_keywords = [
-            "rate_limit", "rate limit", "quota exceeded", "resource_exhausted",
-            "too many requests", "limit reached", "credits", "insufficient",
-        ]
-        auth_keywords = ["invalid api key", "invalid_api_key", "unauthorized", "forbidden"]
-
-        for kw in rate_keywords:
-            if kw in lower:
-                raise KeyExhaustedException()
-        for kw in auth_keywords:
-            if kw in lower:
-                raise KeyAuthError()
-
     async def _stream_openrouter(
         self,
         messages: list[dict[str, str]],
@@ -156,11 +189,24 @@ class AiClient:
                 async with self.session.post(
                     OPENROUTER_URL, json=payload, headers=headers
                 ) as resp:
+                    logger.debug(
+                        "OpenRouter response: status=%d, content-type=%s, key=%s",
+                        resp.status, resp.headers.get("content-type", ""), key.key_hash,
+                    )
+
                     if resp.status == 429:
+                        body = await resp.text()
+                        logger.warning("OpenRouter 429: %s", body[:500])
                         raise KeyExhaustedException()
+
                     if resp.status in (401, 403):
+                        body = await resp.text()
+                        logger.warning("OpenRouter %d: %s", resp.status, body[:500])
                         raise KeyAuthError()
+
                     if resp.status >= 500:
+                        body = await resp.text()
+                        logger.warning("OpenRouter %d: %s", resp.status, body[:500])
                         if retry < max_retries - 1:
                             await asyncio.sleep(5)
                             continue
@@ -168,74 +214,87 @@ class AiClient:
 
                     if resp.status != 200:
                         body = await resp.text()
-                        self._check_error_in_body(body)
+                        logger.warning("OpenRouter %d: %s", resp.status, body[:500])
+                        _classify_error(body)
                         raise AiError(f"API error {resp.status}: {body[:200]}")
 
-                    # Проверяем content-type — если не stream, читаем целиком
+                    # Проверяем content-type
                     content_type = resp.headers.get("content-type", "")
+
                     if "text/event-stream" not in content_type and "stream" not in content_type:
+                        # Не-stream ответ — читаем целиком
                         body = await resp.text()
-                        self._check_error_in_body(body)
-                        # Может быть обычный JSON-ответ
+                        logger.debug("OpenRouter non-stream body: %s", body[:1000])
+
                         try:
                             data = json.loads(body)
-                            error = data.get("error", {})
-                            if error:
-                                error_msg = error.get("message", str(error))
-                                self._check_error_in_body(error_msg)
+
+                            # Проверяем ошибку в JSON
+                            if "error" in data:
+                                error_obj = data["error"]
+                                logger.warning("OpenRouter error in body: %s", error_obj)
+                                _classify_error(error_obj)
+                                error_msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
                                 raise AiError(f"API error: {error_msg[:200]}")
-                            # Извлекаем контент из не-stream ответа
-                            content = (
-                                data.get("choices", [{}])[0]
-                                .get("message", {})
-                                .get("content", "")
-                            )
-                            if content:
-                                yield content
-                                return
+
+                            # Извлекаем контент из обычного ответа
+                            choices = data.get("choices", [])
+                            if choices:
+                                content = choices[0].get("message", {}).get("content", "")
+                                if content:
+                                    yield content
+                                    return
                         except json.JSONDecodeError:
-                            pass
+                            logger.warning("OpenRouter non-JSON body: %s", body[:500])
                         return
 
-                    # Stream-чтение
+                    # SSE stream
                     buffer = ""
                     async for raw_chunk in resp.content.iter_any():
                         buffer += raw_chunk.decode("utf-8", errors="ignore")
+
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
                             if not line:
                                 continue
 
+                            # Извлекаем data из SSE
                             if line.startswith("data: "):
                                 data_str = line[6:]
                             elif line.startswith("data:"):
                                 data_str = line[5:]
+                            elif line.startswith(":"):
+                                continue
                             else:
-                                # Может быть JSON-ошибка без SSE-обёртки
-                                self._check_error_in_body(line)
                                 continue
 
-                            if data_str.strip() == "[DONE]":
+                            data_str = data_str.strip()
+                            if data_str == "[DONE]":
                                 return
+                            if not data_str:
+                                continue
 
                             try:
                                 data = json.loads(data_str)
-                                # Проверяем ошибки внутри SSE
-                                if "error" in data:
-                                    error_msg = data["error"]
-                                    if isinstance(error_msg, dict):
-                                        error_msg = error_msg.get("message", str(error_msg))
-                                    self._check_error_in_body(str(error_msg))
-                                    raise AiError(f"Stream error: {str(error_msg)[:200]}")
 
-                                delta = (
-                                    data.get("choices", [{}])[0]
-                                    .get("delta", {})
-                                    .get("content", "")
-                                )
-                                if delta:
-                                    yield delta
+                                # Ошибка внутри SSE
+                                if "error" in data:
+                                    error_obj = data["error"]
+                                    logger.warning("OpenRouter stream error: %s", error_obj)
+                                    _classify_error(error_obj)
+                                    error_msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
+                                    raise AiError(f"Stream error: {error_msg[:200]}")
+
+                                choices = data.get("choices", [])
+                                if not choices:
+                                    continue
+
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+
                             except json.JSONDecodeError:
                                 continue
                     return
@@ -243,6 +302,7 @@ class AiClient:
             except (KeyExhaustedException, KeyAuthError, AiError):
                 raise
             except aiohttp.ClientError as e:
+                logger.warning("OpenRouter connection error: %s", e)
                 if retry < max_retries - 1:
                     await asyncio.sleep(5)
                     continue
@@ -272,11 +332,24 @@ class AiClient:
                 async with self.session.post(
                     url, json=payload, params=params
                 ) as resp:
+                    logger.debug(
+                        "Gemini response: status=%d, content-type=%s, key=%s",
+                        resp.status, resp.headers.get("content-type", ""), key.key_hash,
+                    )
+
                     if resp.status == 429:
+                        body = await resp.text()
+                        logger.warning("Gemini 429: %s", body[:500])
                         raise KeyExhaustedException()
+
                     if resp.status in (401, 403):
+                        body = await resp.text()
+                        logger.warning("Gemini %d: %s", resp.status, body[:500])
                         raise KeyAuthError()
+
                     if resp.status >= 500:
+                        body = await resp.text()
+                        logger.warning("Gemini %d: %s", resp.status, body[:500])
                         if retry < max_retries - 1:
                             await asyncio.sleep(5)
                             continue
@@ -284,37 +357,61 @@ class AiClient:
 
                     if resp.status != 200:
                         body = await resp.text()
-                        self._check_error_in_body(body)
+                        logger.warning("Gemini %d: %s", resp.status, body[:500])
+
+                        # Парсим JSON-ошибку
+                        try:
+                            data = json.loads(body)
+                            if "error" in data:
+                                error_obj = data["error"]
+                                logger.warning("Gemini error: %s", error_obj)
+                                _classify_error(error_obj)
+                                error_msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
+                                raise AiError(f"Gemini error: {error_msg[:200]}")
+                        except json.JSONDecodeError:
+                            pass
+
+                        _classify_error(body)
                         raise AiError(f"Gemini API error {resp.status}: {body[:200]}")
 
+                    # SSE stream
                     buffer = ""
                     async for raw_chunk in resp.content.iter_any():
                         buffer += raw_chunk.decode("utf-8", errors="ignore")
+
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
                             if not line:
                                 continue
 
+                            # Убираем SSE-префикс
                             if line.startswith("data: "):
                                 line = line[6:]
                             elif line.startswith("data:"):
                                 line = line[5:]
+                            elif line.startswith(":"):
+                                continue
 
-                            self._check_error_in_body(line)
+                            line = line.strip()
+                            if not line:
+                                continue
 
                             try:
                                 data = json.loads(line)
+
+                                # Проверяем ошибку
                                 if "error" in data:
-                                    error_msg = data["error"]
-                                    if isinstance(error_msg, dict):
-                                        error_msg = error_msg.get("message", str(error_msg))
-                                    self._check_error_in_body(str(error_msg))
-                                    raise AiError(f"Gemini error: {str(error_msg)[:200]}")
+                                    error_obj = data["error"]
+                                    logger.warning("Gemini stream error: %s", error_obj)
+                                    _classify_error(error_obj)
+                                    error_msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
+                                    raise AiError(f"Gemini error: {error_msg[:200]}")
 
                                 candidates = data.get("candidates", [])
                                 if not candidates:
                                     continue
+
                                 parts = (
                                     candidates[0]
                                     .get("content", {})
@@ -324,6 +421,7 @@ class AiClient:
                                     text = part.get("text", "")
                                     if text:
                                         yield text
+
                             except json.JSONDecodeError:
                                 continue
                     return
@@ -331,6 +429,7 @@ class AiClient:
             except (KeyExhaustedException, KeyAuthError, AiError):
                 raise
             except aiohttp.ClientError as e:
+                logger.warning("Gemini connection error: %s", e)
                 if retry < max_retries - 1:
                     await asyncio.sleep(5)
                     continue
