@@ -26,8 +26,20 @@ class AllKeysExhaustedError(AiError):
         self.recovery_time = recovery_time
         msg = "Все API-ключи временно исчерпаны."
         if recovery_time:
-            msg += f" Ориентировочное восстановление: {recovery_time}"
+            msg += f"\n⏱ Ориентировочное восстановление: {recovery_time}"
         super().__init__(msg, recoverable=False)
+
+
+class KeyExhaustedException(Exception):
+    pass
+
+
+class KeyAuthError(Exception):
+    pass
+
+
+class ServerError(Exception):
+    pass
 
 
 class AiClient:
@@ -70,10 +82,13 @@ class AiClient:
                 else:
                     gen = self._stream_gemini(messages, model, key)
 
+                collected = False
                 async for chunk in gen:
+                    collected = True
                     yield chunk
 
-                await self._key_manager.record_usage(key.key_hash)
+                if collected:
+                    await self._key_manager.record_usage(key.key_hash)
                 return
 
             except KeyExhaustedException:
@@ -96,10 +111,26 @@ class AiClient:
 
             except asyncio.TimeoutError:
                 logger.warning("Request timeout for key %s", key.key_hash)
-                raise AiError("Превышено время ожидания ответа от AI. Попробуйте ещё раз.")
+                raise AiError("⏱ Превышено время ожидания ответа от AI. Попробуйте ещё раз.")
 
         recovery = await self._key_manager.get_recovery_time(provider)
         raise AllKeysExhaustedError(recovery)
+
+    def _check_error_in_body(self, text: str) -> None:
+        """Проверяет тело ответа на ошибки, которые приходят со статусом 200."""
+        lower = text.lower()
+        rate_keywords = [
+            "rate_limit", "rate limit", "quota exceeded", "resource_exhausted",
+            "too many requests", "limit reached", "credits", "insufficient",
+        ]
+        auth_keywords = ["invalid api key", "invalid_api_key", "unauthorized", "forbidden"]
+
+        for kw in rate_keywords:
+            if kw in lower:
+                raise KeyExhaustedException()
+        for kw in auth_keywords:
+            if kw in lower:
+                raise KeyAuthError()
 
     async def _stream_openrouter(
         self,
@@ -134,33 +165,82 @@ class AiClient:
                             await asyncio.sleep(5)
                             continue
                         raise ServerError(f"Server returned {resp.status}")
+
                     if resp.status != 200:
                         body = await resp.text()
-                        # Проверяем на quota exceeded в теле ответа
-                        if "quota" in body.lower() or "rate" in body.lower():
-                            raise KeyExhaustedException()
+                        self._check_error_in_body(body)
                         raise AiError(f"API error {resp.status}: {body[:200]}")
 
-                    async for line in resp.content:
-                        decoded = line.decode("utf-8", errors="ignore").strip()
-                        if not decoded or not decoded.startswith("data: "):
-                            continue
-                        data_str = decoded[6:]
-                        if data_str == "[DONE]":
-                            break
+                    # Проверяем content-type — если не stream, читаем целиком
+                    content_type = resp.headers.get("content-type", "")
+                    if "text/event-stream" not in content_type and "stream" not in content_type:
+                        body = await resp.text()
+                        self._check_error_in_body(body)
+                        # Может быть обычный JSON-ответ
                         try:
-                            data = json.loads(data_str)
-                            delta = (
+                            data = json.loads(body)
+                            error = data.get("error", {})
+                            if error:
+                                error_msg = error.get("message", str(error))
+                                self._check_error_in_body(error_msg)
+                                raise AiError(f"API error: {error_msg[:200]}")
+                            # Извлекаем контент из не-stream ответа
+                            content = (
                                 data.get("choices", [{}])[0]
-                                .get("delta", {})
+                                .get("message", {})
                                 .get("content", "")
                             )
-                            if delta:
-                                yield delta
-                        except (json.JSONDecodeError, IndexError, KeyError):
-                            continue
+                            if content:
+                                yield content
+                                return
+                        except json.JSONDecodeError:
+                            pass
+                        return
+
+                    # Stream-чтение
+                    buffer = ""
+                    async for raw_chunk in resp.content.iter_any():
+                        buffer += raw_chunk.decode("utf-8", errors="ignore")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                            elif line.startswith("data:"):
+                                data_str = line[5:]
+                            else:
+                                # Может быть JSON-ошибка без SSE-обёртки
+                                self._check_error_in_body(line)
+                                continue
+
+                            if data_str.strip() == "[DONE]":
+                                return
+
+                            try:
+                                data = json.loads(data_str)
+                                # Проверяем ошибки внутри SSE
+                                if "error" in data:
+                                    error_msg = data["error"]
+                                    if isinstance(error_msg, dict):
+                                        error_msg = error_msg.get("message", str(error_msg))
+                                    self._check_error_in_body(str(error_msg))
+                                    raise AiError(f"Stream error: {str(error_msg)[:200]}")
+
+                                delta = (
+                                    data.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                                if delta:
+                                    yield delta
+                            except json.JSONDecodeError:
+                                continue
                     return
-            except (KeyExhaustedException, KeyAuthError):
+
+            except (KeyExhaustedException, KeyAuthError, AiError):
                 raise
             except aiohttp.ClientError as e:
                 if retry < max_retries - 1:
@@ -201,36 +281,54 @@ class AiClient:
                             await asyncio.sleep(5)
                             continue
                         raise ServerError(f"Gemini server returned {resp.status}")
+
                     if resp.status != 200:
                         body = await resp.text()
-                        if "quota" in body.lower() or "rate" in body.lower():
-                            raise KeyExhaustedException()
+                        self._check_error_in_body(body)
                         raise AiError(f"Gemini API error {resp.status}: {body[:200]}")
 
-                    async for line in resp.content:
-                        decoded = line.decode("utf-8", errors="ignore").strip()
-                        if not decoded:
-                            continue
-                        if decoded.startswith("data: "):
-                            decoded = decoded[6:]
-                        try:
-                            data = json.loads(decoded)
-                            candidates = data.get("candidates", [])
-                            if not candidates:
+                    buffer = ""
+                    async for raw_chunk in resp.content.iter_any():
+                        buffer += raw_chunk.decode("utf-8", errors="ignore")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
                                 continue
-                            parts = (
-                                candidates[0]
-                                .get("content", {})
-                                .get("parts", [])
-                            )
-                            for part in parts:
-                                text = part.get("text", "")
-                                if text:
-                                    yield text
-                        except json.JSONDecodeError:
-                            continue
+
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            elif line.startswith("data:"):
+                                line = line[5:]
+
+                            self._check_error_in_body(line)
+
+                            try:
+                                data = json.loads(line)
+                                if "error" in data:
+                                    error_msg = data["error"]
+                                    if isinstance(error_msg, dict):
+                                        error_msg = error_msg.get("message", str(error_msg))
+                                    self._check_error_in_body(str(error_msg))
+                                    raise AiError(f"Gemini error: {str(error_msg)[:200]}")
+
+                                candidates = data.get("candidates", [])
+                                if not candidates:
+                                    continue
+                                parts = (
+                                    candidates[0]
+                                    .get("content", {})
+                                    .get("parts", [])
+                                )
+                                for part in parts:
+                                    text = part.get("text", "")
+                                    if text:
+                                        yield text
+                            except json.JSONDecodeError:
+                                continue
                     return
-            except (KeyExhaustedException, KeyAuthError):
+
+            except (KeyExhaustedException, KeyAuthError, AiError):
                 raise
             except aiohttp.ClientError as e:
                 if retry < max_retries - 1:
@@ -248,14 +346,12 @@ class AiClient:
             if role == "assistant":
                 role = "model"
             elif role == "system":
-                # Gemini не поддерживает system role напрямую, преобразуем в user
                 role = "user"
             contents.append({
                 "role": role,
                 "parts": [{"text": msg["content"]}],
             })
 
-        # Gemini требует чередование ролей; убираем дублирующие подряд
         if not contents:
             return contents
 
@@ -266,20 +362,7 @@ class AiClient:
             else:
                 merged.append(c)
 
-        # Первое сообщение должно быть от user
         if merged and merged[0]["role"] == "model":
             merged.insert(0, {"role": "user", "parts": [{"text": "Hello"}]})
 
         return merged
-
-
-class KeyExhaustedException(Exception):
-    pass
-
-
-class KeyAuthError(Exception):
-    pass
-
-
-class ServerError(Exception):
-    pass

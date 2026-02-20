@@ -34,6 +34,28 @@ HELP_TEXT = """📖 **Список команд:**
 Просто отправь текстовое сообщение — я отвечу с помощью AI.
 Бот помнит последние 15 сообщений диалога."""
 
+# Короткие ID для callback_data (лимит Telegram — 64 байта)
+MODEL_MAP = {
+    "or1": ("openrouter", "google/gemini-2.0-flash-exp:free"),
+    "or2": ("openrouter", "meta-llama/llama-3.3-70b-instruct:free"),
+    "or3": ("openrouter", "mistralai/mistral-small-24b-instruct-2501:free"),
+    "or4": ("openrouter", "qwen/qwen2.5-vl-72b-instruct:free"),
+    "gm1": ("gemini", "gemini-2.0-flash"),
+    "gm2": ("gemini", "gemini-1.5-flash"),
+    "gm3": ("gemini", "gemini-1.5-pro"),
+}
+
+# Обратный маппинг для отображения
+MODEL_NAMES = {
+    "or1": "Gemini 2.0 Flash (free)",
+    "or2": "Llama 3.3 70B (free)",
+    "or3": "Mistral Small 24B (free)",
+    "or4": "Qwen 2.5 VL 72B (free)",
+    "gm1": "Gemini 2.0 Flash",
+    "gm2": "Gemini 1.5 Flash",
+    "gm3": "Gemini 1.5 Pro",
+}
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, config: Config) -> None:
@@ -81,24 +103,26 @@ async def cmd_models(message: Message, config: Config) -> None:
 def _build_models_keyboard(config: Config) -> InlineKeyboardMarkup:
     buttons = []
 
-    or_models = config.get_models_by_provider("openrouter")
-    if or_models:
+    # OpenRouter
+    or_keys = [k for k in MODEL_MAP if k.startswith("or")]
+    if config.api.openrouter_keys:
         buttons.append([InlineKeyboardButton(
             text="── OpenRouter ──", callback_data="noop"
         )])
-        for m in or_models:
+        for key in or_keys:
             buttons.append([InlineKeyboardButton(
-                text=f"🟢 {m.name}", callback_data=f"setmodel:{m.provider}:{m.id}"
+                text=f"🟢 {MODEL_NAMES[key]}", callback_data=f"sm:{key}"
             )])
 
-    gemini_models = config.get_models_by_provider("gemini")
-    if gemini_models:
+    # Gemini
+    gm_keys = [k for k in MODEL_MAP if k.startswith("gm")]
+    if config.api.gemini_keys:
         buttons.append([InlineKeyboardButton(
             text="── Google Gemini ──", callback_data="noop"
         )])
-        for m in gemini_models:
+        for key in gm_keys:
             buttons.append([InlineKeyboardButton(
-                text=f"🔵 {m.name}", callback_data=f"setmodel:{m.provider}:{m.id}"
+                text=f"🔵 {MODEL_NAMES[key]}", callback_data=f"sm:{key}"
             )])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -128,22 +152,19 @@ async def handle_message(
     start_time = time.monotonic()
     full_response = ""
     last_edit_time = 0.0
-    chunk_buffer = ""
 
     try:
         async for chunk in ai_client.stream_response(messages, model, provider):
             full_response += chunk
-            chunk_buffer += chunk
 
             now = time.monotonic()
-            if now - last_edit_time >= 1.0 and full_response.strip():
+            if now - last_edit_time >= 1.5 and full_response.strip():
                 try:
                     display = full_response
                     if len(display) > 4000:
                         display = display[:4000] + "…"
                     await thinking_msg.edit_text(display + " ▌")
                     last_edit_time = now
-                    chunk_buffer = ""
                 except Exception:
                     pass
 
@@ -165,7 +186,7 @@ async def handle_message(
                 user_id, full_response, model, elapsed_ms
             )
         else:
-            await thinking_msg.edit_text("😶 Получен пустой ответ. Попробуйте ещё раз.")
+            await thinking_msg.edit_text("😶 Получен пустой ответ. Попробуйте ещё раз или смените модель /models")
 
     except AllKeysExhaustedError as e:
         await thinking_msg.edit_text(f"⚠️ {e}")
